@@ -210,7 +210,7 @@ class TestPipelineCall:
     def test_call_with_generator(self, pipeline):
         ssl_features = torch.randn(1, 1024, 4, 4)
         magnification = torch.tensor([0])
-        gen = torch.Generator().manual_seed(42)
+        gen = torch.Generator(device="cpu").manual_seed(42)
 
         output = pipeline(
             ssl_features=ssl_features,

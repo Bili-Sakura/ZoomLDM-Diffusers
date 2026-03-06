@@ -320,7 +320,7 @@ class ZoomLDMPipeline(DiffusionPipeline):
             cond_input = torch.cat([uc, cc])
 
             # Predict noise with the UNet
-            with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
+            with torch.amp.autocast(device_type=device.type, enabled=device.type != "cpu"):
                 if self.conditioning_key == "crossattn":
                     noise_pred = self.unet(
                         latent_model_input,

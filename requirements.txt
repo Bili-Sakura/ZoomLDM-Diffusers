@@ -46,6 +46,7 @@ pytorch-fid
 wandb==0.15.4
 h5py
 huggingface_hub
+diffusers>=0.25.0
 datasets==3.0.2
 taming-transformers-rom1504 
 -e git+https://github.com/openai/CLIP.git@main#egg=clip

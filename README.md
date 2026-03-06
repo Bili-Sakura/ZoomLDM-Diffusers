@@ -22,6 +22,32 @@ The model weights are hosted on [huggingface](https://huggingface.co/StonyBrook-
 
 ## Inference
 
+### Diffusers Pipeline
+
+ZoomLDM can be used as a native [huggingface/diffusers](https://github.com/huggingface/diffusers) custom pipeline:
+
+```python
+import torch
+from huggingface_hub import hf_hub_download
+from pipeline_zoomldm import ZoomLDMPipeline
+
+# Load from original config + checkpoint
+ckpt_path = hf_hub_download(repo_id="StonyBrook-CVLab/ZoomLDM", filename="brca/weights.ckpt")
+config_path = hf_hub_download(repo_id="StonyBrook-CVLab/ZoomLDM", filename="brca/config.yaml")
+pipe = ZoomLDMPipeline.from_single_file(config_path, ckpt_path, device="cuda")
+
+# Generate images
+output = pipe(
+    ssl_features=batch["ssl_feat"].to("cuda"),
+    magnification=batch["mag"].to("cuda"),
+    num_inference_steps=50,
+    guidance_scale=2.0,
+)
+images = output.images  # List of PIL images
+```
+
+The pipeline uses the native diffusers `DDIMScheduler` and provides a standard `DiffusionPipeline` interface. You can also construct the pipeline from an existing `LatentDiffusion` model using `ZoomLDMPipeline.from_ldm_model(model)`.
+
 ### Patch level generation
 <center>
 <a href="./assets/patches.png">

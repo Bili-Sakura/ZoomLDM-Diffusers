@@ -40,9 +40,14 @@ def save_custom_component(component, config, save_path: Path, safe_serialization
     # Save config for reconstruction (OmegaConf -> dict for JSON)
     config_path = save_path / "config.json"
     try:
-        config_to_save = OmegaConf.to_container(config, resolve=True) if hasattr(config, "to_container") else dict(config)
+        if hasattr(config, "to_container"):
+            config_to_save = OmegaConf.to_container(config, resolve=True)
+        elif isinstance(config, dict):
+            config_to_save = config
+        else:
+            config_to_save = OmegaConf.to_container(OmegaConf.create(config), resolve=True)
     except Exception:
-        config_to_save = dict(config) if not isinstance(config, dict) else config
+        config_to_save = OmegaConf.to_container(config, resolve=True)
 
     with open(config_path, "w") as f:
         json.dump(config_to_save, f, indent=2)
@@ -86,10 +91,26 @@ def main():
         if not ckpt_path:
             raise ValueError("--ckpt_path required when using --config_path")
 
+    # Patch config: remove unet ckpt_path so we load from main checkpoint
+    config = OmegaConf.load(config_path)
+    if "model" in config and "params" in config.model:
+        unet_cfg = config.model.params.get("unet_config")
+        if unet_cfg is not None:
+            params = OmegaConf.to_container(unet_cfg.get("params") or {}, resolve=True)
+            if isinstance(params, dict):
+                params.pop("ckpt_path", None)
+                params.pop("ignore_keys", None)
+                config.model.params.unet_config.params = OmegaConf.create(params)
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+            OmegaConf.save(config, f.name)
+            config_path = f.name
+
     from pipeline_zoomldm import ZoomLDMPipeline
 
     print("Loading ZoomLDM pipeline...")
-    pipe = ZoomLDMPipeline.from_single_file(config_path, ckpt_path, device=args.device)
+    # Use device=None to avoid diffusers .to() which expects standard module attributes
+    pipe = ZoomLDMPipeline.from_single_file(config_path, ckpt_path, device=None)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

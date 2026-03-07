@@ -32,23 +32,28 @@ sys.path.insert(0, str(_script_dir))
 from safetensors.torch import save_file as save_safetensors
 
 
+def _to_standard_config(raw):
+    """Convert raw {target, params} to standard diffusers-style flat config."""
+    if isinstance(raw, dict) and "params" in raw:
+        params = raw.get("params") or {}
+        params = OmegaConf.to_container(params, resolve=True) if hasattr(params, "to_container") else dict(params)
+    else:
+        params = OmegaConf.to_container(raw, resolve=True) if hasattr(raw, "to_container") else dict(raw)
+    params.pop("ckpt_path", None)
+    params.pop("ignore_keys", None)
+    # Remove nested "target" (e.g. lossconfig.target) - loader adds default for VAE
+    if "lossconfig" in params and isinstance(params["lossconfig"], dict):
+        params["lossconfig"] = {}
+    return params
+
+
 def save_custom_component(component, config, save_path: Path, safe_serialization: bool = True):
-    """Save a custom LDM component (unet, vae, conditioning_encoder) in diffusers format."""
+    """Save a custom LDM component in standard diffusers-style config (no raw target/params)."""
     save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
 
-    # Save config for reconstruction (OmegaConf -> dict for JSON)
     config_path = save_path / "config.json"
-    try:
-        if hasattr(config, "to_container"):
-            config_to_save = OmegaConf.to_container(config, resolve=True)
-        elif isinstance(config, dict):
-            config_to_save = config
-        else:
-            config_to_save = OmegaConf.to_container(OmegaConf.create(config), resolve=True)
-    except Exception:
-        config_to_save = OmegaConf.to_container(config, resolve=True)
-
+    config_to_save = _to_standard_config(config)
     with open(config_path, "w") as f:
         json.dump(config_to_save, f, indent=2)
 
@@ -158,22 +163,9 @@ def main():
         json.dump(model_index, f, indent=2)
     print(f"  Saved model_index.json")
 
-    # 6. Copy pipeline_zoomldm.py for custom pipeline loading
-    pipeline_src = _script_dir / "pipeline_zoomldm.py"
-    pipeline_dst = output_dir / "pipeline_zoomldm"
-    pipeline_dst.mkdir(exist_ok=True)
-    shutil.copy(pipeline_src, pipeline_dst / "pipeline_zoomldm.py")
-    # Add __init__.py for package
-    (pipeline_dst / "__init__.py").write_text("from .pipeline_zoomldm import ZoomLDMPipeline\n")
-    print(f"  Saved pipeline_zoomldm")
-
-    # 7. Save scale_factor and conditioning_key in a small config for from_pretrained
-    pipeline_config = {
-        "scale_factor": pipe.scale_factor,
-        "conditioning_key": pipe.conditioning_key,
-    }
-    with open(output_dir / "pipeline_config.json", "w") as f:
-        json.dump(pipeline_config, f, indent=2)
+    # 6. Copy pipeline_zoomldm.py to output root (scale_factor, conditioning_key in model_index.json)
+    shutil.copy(_script_dir / "pipeline_zoomldm.py", output_dir / "pipeline_zoomldm.py")
+    print(f"  Saved pipeline_zoomldm.py")
 
     print(f"\nDone! Diffusers-format model saved to {output_dir}")
     print("Load with: ZoomLDMPipeline.from_pretrained('<path>')")

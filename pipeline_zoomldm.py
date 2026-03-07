@@ -1,28 +1,14 @@
 """
 Custom diffusers pipeline for ZoomLDM multi-scale image generation.
 
-Usage:
-    # Load from original config + checkpoint
-    pipe = ZoomLDMPipeline.from_single_file(
-        config_path="brca/config.yaml",
-        ckpt_path="brca/weights.ckpt",
-    )
-
-    # Load from diffusers-format (after convert_to_diffusers.py)
-    pipe = ZoomLDMPipeline.from_pretrained("/path/to/zoomldm_diffusers")
-
-    # Or from a pre-loaded LatentDiffusion model
-    pipe = ZoomLDMPipeline.from_ldm_model(model)
-
-    # Generate images
-    images = pipe(
-        ssl_features=batch["ssl_feat"],
-        magnification=batch["mag"],
-        num_inference_steps=50,
-        guidance_scale=2.0,
-    ).images
+Dependencies: diffusers, torch; optional: safetensors, huggingface_hub, PyYAML.
+Uses only stdlib (json, importlib) plus the above. No OmegaConf.
+Model architectures (UNet, VAE, conditioning encoder) require the ldm package
+(ZoomLDM-Diffusers project) on PYTHONPATH when loading.
 """
 
+import importlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Union
@@ -32,6 +18,24 @@ import torch
 from diffusers import DDIMScheduler, DiffusionPipeline
 from diffusers.utils import BaseOutput
 from PIL import Image
+
+
+def _get_class(target: str):
+    """Resolve a class from a dotted path (e.g. 'ldm.modules.xxx.UNetModel')."""
+    module_path, cls_name = target.rsplit(".", 1)
+    mod = importlib.import_module(module_path)
+    return getattr(mod, cls_name)
+
+
+def _instantiate_from_config(config: dict):
+    """Instantiate from a dict with 'target' and optional 'params' (no OmegaConf)."""
+    if not isinstance(config, dict) or "target" not in config:
+        if config == "__is_first_stage__" or config == "__is_unconditional__":
+            return None
+        raise KeyError("Expected key 'target' to instantiate.")
+    cls = _get_class(config["target"])
+    params = config.get("params", {})
+    return cls(**params)
 
 
 @dataclass
@@ -100,6 +104,8 @@ class ZoomLDMPipeline(DiffusionPipeline):
         Load a ``ZoomLDMPipeline`` from original ZoomLDM config and
         checkpoint files.
 
+        Requires the ZoomLDM-Diffusers project (or ldm) on PYTHONPATH.
+
         Args:
             config_path: Path to the YAML config file.
             ckpt_path: Path to the model checkpoint (``.ckpt`` or
@@ -122,12 +128,11 @@ class ZoomLDMPipeline(DiffusionPipeline):
             pipe = ZoomLDMPipeline.from_single_file(cfg, ckpt)
             pipe = pipe.to("cuda")
         """
-        from omegaconf import OmegaConf
+        import yaml
 
-        from ldm.util import instantiate_from_config
-
-        config = OmegaConf.load(config_path)
-        model = instantiate_from_config(config.model)
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+        model = _instantiate_from_config(config["model"])
         state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         if "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
@@ -229,35 +234,40 @@ class ZoomLDMPipeline(DiffusionPipeline):
             )
             pipe = pipe.to("cuda")
         """
-        from omegaconf import OmegaConf
-
-        from ldm.util import instantiate_from_config
-
         path = Path(pretrained_model_name_or_path)
         if not path.exists():
-            # Try HuggingFace Hub
             from huggingface_hub import snapshot_download
 
             path = Path(snapshot_download(pretrained_model_name_or_path))
 
         path = path.resolve()
 
-        # Load scheduler
         scheduler = DDIMScheduler.from_pretrained(path / "scheduler")
 
-        # Load custom components (unet, vae, conditioning_encoder)
+        _TARGETS = {
+            "unet": "ldm.modules.diffusionmodules.openaimodel.UNetModel",
+            "vae": "ldm.models.autoencoder.VQModelInterface",
+            "conditioning_encoder": "ldm.modules.encoders.modules.EmbeddingViT2_5",
+        }
+
         def load_custom_component(name: str):
             comp_path = path / name
             with open(comp_path / "config.json") as f:
-                import json
-
                 cfg = json.load(f)
-            # Remove ckpt_path so we load our saved weights instead
-            if "params" in cfg and cfg["params"] is not None:
-                cfg["params"].pop("ckpt_path", None)
-                cfg["params"].pop("ignore_keys", None)
-            config = OmegaConf.create(cfg)
-            component = instantiate_from_config(config)
+
+            if "target" in cfg:
+                params = dict(cfg.get("params", {k: v for k, v in cfg.items() if k != "target"}))
+                params.pop("ckpt_path", None)
+                params.pop("ignore_keys", None)
+                component = _instantiate_from_config({"target": cfg["target"], "params": params})
+            else:
+                model_cls = _get_class(_TARGETS[name])
+                params = dict(cfg)
+                if name == "vae":
+                    lc = params.get("lossconfig") or {}
+                    if "target" not in lc:
+                        params["lossconfig"] = {"target": "torch.nn.Identity", "params": {}}
+                component = model_cls(**params)
 
             # Load weights
             safetensors_path = comp_path / "diffusion_pytorch_model.safetensors"
@@ -287,15 +297,12 @@ class ZoomLDMPipeline(DiffusionPipeline):
         if hasattr(conditioning_encoder, "p_uncond"):
             conditioning_encoder.p_uncond = 0
 
-        # Load scale_factor and conditioning_key
-        pipeline_config_path = path / "pipeline_config.json"
-        if pipeline_config_path.exists():
-            import json
-
-            with open(pipeline_config_path) as f:
-                pipeline_config = json.load(f)
-            scale_factor = pipeline_config.get("scale_factor", 1.0)
-            conditioning_key = pipeline_config.get("conditioning_key", "crossattn")
+        model_index_path = path / "model_index.json"
+        if model_index_path.exists():
+            with open(model_index_path) as f:
+                model_index = json.load(f)
+            scale_factor = model_index.get("scale_factor", 1.0)
+            conditioning_key = model_index.get("conditioning_key", "crossattn")
         else:
             scale_factor = 1.0
             conditioning_key = "crossattn"

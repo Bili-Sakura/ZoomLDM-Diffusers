@@ -8,6 +8,9 @@ Usage:
         ckpt_path="brca/weights.ckpt",
     )
 
+    # Load from diffusers-format (after convert_to_diffusers.py)
+    pipe = ZoomLDMPipeline.from_pretrained("/path/to/zoomldm_diffusers")
+
     # Or from a pre-loaded LatentDiffusion model
     pipe = ZoomLDMPipeline.from_ldm_model(model)
 
@@ -21,6 +24,7 @@ Usage:
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Union
 
 import numpy as np
@@ -198,6 +202,117 @@ class ZoomLDMPipeline(DiffusionPipeline):
             scale_factor=sf,
             conditioning_key=conditioning_key,
         )
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Union[str, Path],
+        device: Optional[Union[str, torch.device]] = None,
+        **kwargs,
+    ):
+        """
+        Load a ``ZoomLDMPipeline`` from a diffusers-format directory
+        (created by ``convert_to_diffusers.py``).
+
+        Args:
+            pretrained_model_name_or_path: Path to the diffusers-format
+                directory (or HuggingFace repo ID).
+            device: Device to load the model onto.
+
+        Returns:
+            A ``ZoomLDMPipeline`` instance.
+
+        Example::
+
+            pipe = ZoomLDMPipeline.from_pretrained(
+                "/root/worksapce/models/BiliSakura/ZoomLDM"
+            )
+            pipe = pipe.to("cuda")
+        """
+        from omegaconf import OmegaConf
+
+        from ldm.util import instantiate_from_config
+
+        path = Path(pretrained_model_name_or_path)
+        if not path.exists():
+            # Try HuggingFace Hub
+            from huggingface_hub import snapshot_download
+
+            path = Path(snapshot_download(pretrained_model_name_or_path))
+
+        path = path.resolve()
+
+        # Load scheduler
+        scheduler = DDIMScheduler.from_pretrained(path / "scheduler")
+
+        # Load custom components (unet, vae, conditioning_encoder)
+        def load_custom_component(name: str):
+            comp_path = path / name
+            with open(comp_path / "config.json") as f:
+                import json
+
+                cfg = json.load(f)
+            # Remove ckpt_path so we load our saved weights instead
+            if "params" in cfg and cfg["params"] is not None:
+                cfg["params"].pop("ckpt_path", None)
+                cfg["params"].pop("ignore_keys", None)
+            config = OmegaConf.create(cfg)
+            component = instantiate_from_config(config)
+
+            # Load weights
+            safetensors_path = comp_path / "diffusion_pytorch_model.safetensors"
+            bin_path = comp_path / "diffusion_pytorch_model.bin"
+            if safetensors_path.exists():
+                from safetensors.torch import load_file
+
+                state = load_file(str(safetensors_path))
+            elif bin_path.exists():
+                try:
+                    state = torch.load(bin_path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    state = torch.load(bin_path, map_location="cpu")
+            else:
+                raise FileNotFoundError(
+                    f"No weights found in {comp_path} "
+                    "(expected diffusion_pytorch_model.safetensors or .bin)"
+                )
+            component.load_state_dict(state, strict=True)
+            component.eval()
+            return component
+
+        unet = load_custom_component("unet")
+        vae = load_custom_component("vae")
+        conditioning_encoder = load_custom_component("conditioning_encoder")
+
+        if hasattr(conditioning_encoder, "p_uncond"):
+            conditioning_encoder.p_uncond = 0
+
+        # Load scale_factor and conditioning_key
+        pipeline_config_path = path / "pipeline_config.json"
+        if pipeline_config_path.exists():
+            import json
+
+            with open(pipeline_config_path) as f:
+                pipeline_config = json.load(f)
+            scale_factor = pipeline_config.get("scale_factor", 1.0)
+            conditioning_key = pipeline_config.get("conditioning_key", "crossattn")
+        else:
+            scale_factor = 1.0
+            conditioning_key = "crossattn"
+
+        pipe = cls(
+            unet=unet,
+            vae=vae,
+            conditioning_encoder=conditioning_encoder,
+            scheduler=scheduler,
+            scale_factor=scale_factor,
+            conditioning_key=conditioning_key,
+        )
+
+        if device is not None:
+            pipe = pipe.to(device)
+
+        return pipe
 
     def encode_conditioning(self, ssl_features, magnification):
         """

@@ -98,6 +98,32 @@ class ZoomLDMPipeline(DiffusionPipeline):
         except StopIteration:
             return torch.device("cpu")
 
+    def to(self, *args, **kwargs):
+        """
+        Move pipeline modules to a device/dtype.
+
+        Diffusers' default ``DiffusionPipeline.to`` expects each module to
+        expose a ``dtype`` attribute. ``EmbeddingViT2_5`` does not, which can
+        raise an ``AttributeError``. This override keeps standard ``pipe.to``
+        usage working for ZoomLDM custom components.
+        """
+        module_kwargs = {}
+        for key in ("dtype", "non_blocking", "memory_format"):
+            if key in kwargs:
+                module_kwargs[key] = kwargs[key]
+
+        # Ignore diffusers-only kwargs not accepted by torch.nn.Module.to.
+        device_or_dtype_args = args
+        if not device_or_dtype_args and "device" in kwargs:
+            device_or_dtype_args = (kwargs["device"],)
+
+        for name in ("unet", "vae", "conditioning_encoder"):
+            module = getattr(self, name, None)
+            if module is not None:
+                module.to(*device_or_dtype_args, **module_kwargs)
+
+        return self
+
     @classmethod
     def from_single_file(cls, config_path, ckpt_path, device=None, **kwargs):
         """
@@ -212,6 +238,7 @@ class ZoomLDMPipeline(DiffusionPipeline):
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: Union[str, Path],
+        variant: Optional[str] = None,
         device: Optional[Union[str, torch.device]] = None,
         **kwargs,
     ):
@@ -222,6 +249,10 @@ class ZoomLDMPipeline(DiffusionPipeline):
         Args:
             pretrained_model_name_or_path: Path to the diffusers-format
                 directory (or HuggingFace repo ID).
+            variant: Optional model variant to load when
+                ``pretrained_model_name_or_path`` points to a root directory
+                containing multiple self-contained subfolders (e.g.
+                ``"brca"``, ``"naip"``).
             device: Device to load the model onto.
 
         Returns:
@@ -241,8 +272,44 @@ class ZoomLDMPipeline(DiffusionPipeline):
             path = Path(snapshot_download(pretrained_model_name_or_path))
 
         path = path.resolve()
+        # Diffusers-style alias: use subfolder to pick a variant directory.
+        subfolder = kwargs.pop("subfolder", None)
+        if variant is None and subfolder is not None:
+            variant = subfolder
+        def _is_diffusers_model_dir(candidate: Path) -> bool:
+            required = [
+                candidate / "model_index.json",
+                candidate / "scheduler" / "scheduler_config.json",
+                candidate / "unet" / "config.json",
+                candidate / "vae" / "config.json",
+                candidate / "conditioning_encoder" / "config.json",
+            ]
+            return all(p.exists() for p in required)
 
-        scheduler = DDIMScheduler.from_pretrained(path / "scheduler")
+        if variant:
+            model_dir = path / variant
+            if not _is_diffusers_model_dir(model_dir):
+                raise FileNotFoundError(
+                    f"Variant '{variant}' was requested, but '{model_dir}' is not a valid model directory."
+                )
+        elif _is_diffusers_model_dir(path):
+            model_dir = path
+        else:
+            candidate_dirs = [d for d in path.iterdir() if d.is_dir() and _is_diffusers_model_dir(d)]
+            if not candidate_dirs:
+                raise FileNotFoundError(
+                    f"No diffusers model found at '{path}'. "
+                    "Expected model files in this directory or in subfolders (e.g. brca/, naip/)."
+                )
+            if len(candidate_dirs) > 1:
+                variants = ", ".join(sorted(d.name for d in candidate_dirs))
+                raise ValueError(
+                    f"Multiple model variants found at '{path}': {variants}. "
+                    "Pass variant='<name>' to select one."
+                )
+            model_dir = candidate_dirs[0]
+
+        scheduler = DDIMScheduler.from_pretrained(model_dir / "scheduler")
 
         _TARGETS = {
             "unet": "ldm.modules.diffusionmodules.openaimodel.UNetModel",
@@ -251,7 +318,7 @@ class ZoomLDMPipeline(DiffusionPipeline):
         }
 
         def load_custom_component(name: str):
-            comp_path = path / name
+            comp_path = model_dir / name
             with open(comp_path / "config.json") as f:
                 cfg = json.load(f)
 
@@ -297,7 +364,7 @@ class ZoomLDMPipeline(DiffusionPipeline):
         if hasattr(conditioning_encoder, "p_uncond"):
             conditioning_encoder.p_uncond = 0
 
-        model_index_path = path / "model_index.json"
+        model_index_path = model_dir / "model_index.json"
         if model_index_path.exists():
             with open(model_index_path) as f:
                 model_index = json.load(f)
